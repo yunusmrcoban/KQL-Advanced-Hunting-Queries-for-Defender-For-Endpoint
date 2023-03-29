@@ -1,3 +1,4 @@
+//author:yunusmrcoban
 DeviceNetworkEvents
 | where InitiatingProcessFileName has '3CXDesktopApp.exe'
 | where RemoteUrl in~ ('akamaicontainer.com',
