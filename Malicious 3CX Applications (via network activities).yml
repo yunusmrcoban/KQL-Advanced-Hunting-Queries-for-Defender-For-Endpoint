@@ -1,0 +1,25 @@
+DeviceNetworkEvents
+| where InitiatingProcessFileName has '3CXDesktopApp.exe'
+| where RemoteUrl in~ ('akamaicontainer.com',
+'akamaitechcloudservices.com',
+'azuredeploystore.com',
+'azureonlinecloud.com',
+'azureonlinestorage.com',
+'dunamistrd.com',
+'glcloudservice.com',
+'journalide.org',
+'msedgepackageinfo.com',
+'msstorageazure.com',
+'msstorageboxes.com',
+'officeaddons.com',
+'officestoragebox.com',
+'pbxcloudeservices.com',
+'pbxphonenetwork.com',
+'pbxsources.com',
+'qwepoi123098.com',
+'sbmsa.wiki',
+'sourceslabs.com',
+'visualstudiofactory.com',
+'zacharryblogs.com')
+| where Timestamp > ago(30d)
+//ref:https://github.com/SigmaHQ/sigma/pull/4151/files
