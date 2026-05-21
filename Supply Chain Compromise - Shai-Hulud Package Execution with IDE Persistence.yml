@@ -1,0 +1,184 @@
+DeviceFileEvents
+| where TimeGenerated > ago(14d)
+| where ActionType in~ ("FileCreated", "FileModified", "FileRenamed")
+| extend FullPath = iff(FolderPath endswith "\\" or FolderPath endswith "/", strcat(FolderPath, FileName), strcat(FolderPath, "/", FileName))
+| extend FullPathL = tolower(FullPath),
+         CmdL = tolower(coalesce(InitiatingProcessCommandLine, "")),
+         ProcL = tolower(coalesce(InitiatingProcessFileName, "")),
+         ParentL = tolower(coalesce(InitiatingProcessParentFileName, ""))
+| extend IsIdeConfigTouched = FullPathL has_any (dynamic([
+             "/.vscode/tasks.json", "\\.vscode\\tasks.json",
+             "/.vscode/settings.json", "\\.vscode\\settings.json",
+             "/.claude/settings.json", "\\.claude\\settings.json",
+             "/.cursor/rules", "\\.cursor\\rules",
+             "/.idea/workspace.xml", "\\.idea\\workspace.xml"
+         ])),
+         IsIdePayloadDropped = FullPathL has_any (dynamic([
+             "/.vscode/", "\\.vscode\\",
+             "/.claude/", "\\.claude\\",
+             "/.cursor/", "\\.cursor\\",
+             "/.idea/", "\\.idea\\"
+         ])) and (FileName in~ (dynamic([
+             "setup.mjs", "router_runtime.js", "router_init.js", "tanstack_runner.js"
+         ])) or FullPathL has_any (dynamic([
+             "setup.mjs", "router_runtime.js", "router_init.js", "tanstack_runner.js"
+         ]))),
+         IsKnownIoC = CmdL has_any (dynamic([
+             "setup.mjs", "router_runtime.js", "router_init.js", "tanstack_runner.js"
+         ])) or FileName in~ (dynamic([
+             "setup.mjs", "router_runtime.js", "router_init.js", "tanstack_runner.js"
+         ])),
+         IsPkgManagerContext = CmdL has_any (dynamic([
+             "npm ", "npm.cmd", "npx ", "pnpm ", "yarn ", "bun ",
+             "pip ", "pip3 ", "python -m pip", "poetry ", "pipenv ", "uv pip", "conda ",
+             "gem ", "bundle ", "cargo ", "go install ", "dotnet add package", "nuget ", "composer "
+         ])) or ProcL in~ (dynamic([
+             "node", "node.exe", "npm", "npm.cmd", "npx", "npx.cmd", "pnpm", "pnpm.exe",
+             "yarn", "yarn.cmd", "bun", "python", "python3", "python.exe", "pip", "pip3",
+             "poetry", "pipenv", "uv", "conda", "gem", "bundle", "cargo", "go", "dotnet", "nuget", "composer"
+         ])) or ParentL in~ (dynamic([
+             "node", "node.exe", "npm", "npm.cmd", "npx", "npx.cmd", "pnpm", "pnpm.exe",
+             "yarn", "yarn.cmd", "bun", "python", "python3", "python.exe", "pip", "pip3",
+             "poetry", "pipenv", "uv", "conda", "gem", "bundle", "cargo", "go", "dotnet", "nuget", "composer"
+         ]))
+| where IsKnownIoC or ((IsIdeConfigTouched or IsIdePayloadDropped) and IsPkgManagerContext)
+| summarize
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated),
+    Hits = count(),
+    IdeRiskScore = sum(case(IsKnownIoC, 60, IsIdePayloadDropped, 45, 35)),
+    IdeEventCount = count(),
+    KnownIoCCount = countif(IsKnownIoC),
+    Accounts = make_set(tostring(InitiatingProcessAccountName), 10),
+    IdeEvidenceDetails = make_set(case(
+        IsKnownIoC and IsIdePayloadDropped, strcat("Known IoC payload in IDE path: ", FileName),
+        IsKnownIoC, strcat("Known IoC in IDE workflow: ", FileName),
+        IsIdePayloadDropped, strcat("IDE payload dropped by package flow: ", FileName),
+        strcat("IDE config touched by package lifecycle: ", FileName)
+    ), 20),
+    FilePaths = make_set(FullPath, 20),
+    IdeProcessNames = make_set(InitiatingProcessFileName, 10),
+    IdeParentProcesses = make_set(InitiatingProcessParentFileName, 10),
+    IdeCommandLines = make_set(InitiatingProcessCommandLine, 10)
+    by DeviceName, CorrelationBucket = bin(TimeGenerated, 1d)
+| join kind=leftouter (
+    DeviceProcessEvents
+    | where TimeGenerated > ago(14d)
+    | extend CmdL = tolower(coalesce(ProcessCommandLine, ""))
+    | where CmdL has_any (dynamic([
+        "npm ", "npm.cmd", "npx ", "pnpm ", "yarn ", "bun ",
+        "pip ", "pip3 ", "python -m pip", "poetry ", "pipenv ", "uv pip", "conda ",
+        "gem ", "bundle ", "cargo ", "go install ", "dotnet add package", "nuget ", "composer "
+    ]))
+    | extend Ecosystem = case(
+        CmdL has "npm " or CmdL has "npx " or CmdL has "pnpm " or CmdL has "yarn " or CmdL has "bun ", "npm",
+        CmdL has "pip " or CmdL has "pip3 " or CmdL has "python -m pip" or CmdL has "poetry " or CmdL has "pipenv " or CmdL has "uv pip" or CmdL has "conda ", "pypi",
+        CmdL has "gem " or CmdL has "bundle ", "rubygems",
+        CmdL has "cargo ", "crates",
+        CmdL has "go install ", "go",
+        CmdL has "dotnet add package" or CmdL has "nuget ", "nuget",
+        CmdL has "composer ", "packagist",
+        "other"
+    )
+    | extend PackageName = tolower(coalesce(
+        extract(@'(?:npm\s+(?:i|install)|pnpm\s+(?:i|install|add)|yarn\s+add|bun\s+add)\s+((?:@[a-z0-9\._-]+/)?[a-z0-9\._-]+)(?:@[0-9a-z\._\-\+]+)?', 1, CmdL),
+        extract(@'pip3?\s+install\s+([a-z0-9\._-]+)(?:==[0-9a-z\._\-\+]+)?', 1, CmdL),
+        extract(@'python\s+-m\s+pip\s+install\s+([a-z0-9\._-]+)(?:==[0-9a-z\._\-\+]+)?', 1, CmdL),
+        extract(@'poetry\s+add\s+([a-z0-9\._-]+)(?:@[0-9a-z\._\-\+]+)?', 1, CmdL),
+        extract(@'pipenv\s+install\s+([a-z0-9\._-]+)(?:==[0-9a-z\._\-\+]+)?', 1, CmdL),
+        extract(@'uv\s+pip\s+install\s+([a-z0-9\._-]+)(?:==[0-9a-z\._\-\+]+)?', 1, CmdL),
+        ""
+    ))
+    | extend PackageVersion = tolower(coalesce(
+        extract(@'(?:npm\s+(?:i|install)|pnpm\s+(?:i|install|add)|yarn\s+add|bun\s+add)\s+(?:@[a-z0-9\._-]+/)?[a-z0-9\._-]+@([0-9a-z\._\-\+]+)', 1, CmdL),
+        extract(@'pip3?\s+install\s+[a-z0-9\._-]+==([0-9a-z\._\-\+]+)', 1, CmdL),
+        extract(@'python\s+-m\s+pip\s+install\s+[a-z0-9\._-]+==([0-9a-z\._\-\+]+)', 1, CmdL),
+        extract(@'poetry\s+add\s+[a-z0-9\._-]+@([0-9a-z\._\-\+]+)', 1, CmdL),
+        extract(@'pipenv\s+install\s+[a-z0-9\._-]+==([0-9a-z\._\-\+]+)', 1, CmdL),
+        extract(@'uv\s+pip\s+install\s+[a-z0-9\._-]+==([0-9a-z\._\-\+]+)', 1, CmdL),
+        ""
+    ))
+    | where isnotempty(Ecosystem) and isnotempty(PackageName)
+    | lookup kind=leftouter (
+        externaldata(RawLine: string) [
+            @'https://raw.githubusercontent.com/Cobenian/shai-hulud-detect/refs/heads/main/compromised-packages.txt'
+        ] with (format='txt')
+        | where isnotempty(trim(@'\s', RawLine)) and RawLine !startswith "#"
+        | extend Parts = split(RawLine, ":")
+        | extend
+            Ecosystem = iff(array_length(Parts) >= 3, tolower(trim(@' ', tostring(Parts[0]))), "npm"),
+            PackageName = iff(array_length(Parts) >= 3, tolower(trim(@' ', tostring(Parts[1]))), tolower(trim(@' ', tostring(Parts[0])))),
+            WatchlistPackageVersion = iff(array_length(Parts) >= 3, tolower(trim(@' ', tostring(Parts[2]))), iff(array_length(Parts) >= 2, tolower(trim(@' ', tostring(Parts[1]))), ""))
+        | where isnotempty(Ecosystem) and isnotempty(PackageName)
+        | project Ecosystem, PackageName, WatchlistPackageVersion, PkgSource = "shai-hulud-detect", PkgConfidence = "High", PkgNotes = "Compromised supply chain package (shai-hulud-detect feed)"
+    ) on Ecosystem, PackageName
+    | where isnotempty(PkgSource)
+    | where isempty(WatchlistPackageVersion) or isempty(PackageVersion) or PackageVersion == WatchlistPackageVersion
+    | summarize
+        PackageRiskScore = 25 * count(),
+        CompromisedPackageCount = count(),
+        PackagePairs = make_set(strcat(Ecosystem, ":", PackageName, iff(isnotempty(PackageVersion), strcat(":", PackageVersion), "")), 20),
+        PackageEvidenceDetails = make_set(strcat("Compromised package execution: ", Ecosystem, ":", PackageName, iff(isnotempty(PackageVersion), strcat(":", PackageVersion), "")), 20),
+        PackageProcessNames = make_set(FileName, 10),
+        PackageParentProcesses = make_set(InitiatingProcessFileName, 10),
+        PackageCommandLines = make_set(ProcessCommandLine, 10),
+        PackageSources = make_set(PkgSource, 10),
+        PackageConfidences = make_set(PkgConfidence, 10),
+        PackageNotes = make_set(PkgNotes, 10)
+        by DeviceName, CorrelationBucket = bin(TimeGenerated, 1d)
+) on DeviceName, CorrelationBucket
+| extend
+    PackageRiskScore = coalesce(PackageRiskScore, 0),
+    CompromisedPackageCount = coalesce(CompromisedPackageCount, 0)
+| extend TotalRiskScore = IdeRiskScore + PackageRiskScore
+| extend EvidenceTypes = dynamic(["ide_persistence"])
+| extend EvidenceTypes = iff(CompromisedPackageCount > 0, array_concat(EvidenceTypes, dynamic(["compromised_package"])), EvidenceTypes)
+| extend EvidenceDetails = array_concat(
+    IdeEvidenceDetails,
+    coalesce(PackageEvidenceDetails, dynamic([]))
+)
+| extend ProcessNames = array_concat(
+    IdeProcessNames,
+    coalesce(PackageProcessNames, dynamic([]))
+)
+| extend ParentProcesses = array_concat(
+    IdeParentProcesses,
+    coalesce(PackageParentProcesses, dynamic([]))
+)
+| extend CommandLines = array_concat(
+    IdeCommandLines,
+    coalesce(PackageCommandLines, dynamic([]))
+)
+| extend Sources = coalesce(PackageSources, dynamic([]))
+| extend Confidences = coalesce(PackageConfidences, dynamic([]))
+| extend Notes = coalesce(PackageNotes, dynamic([]))
+| extend Severity = case(
+    KnownIoCCount > 0 and CompromisedPackageCount > 0, "High",
+    KnownIoCCount > 0, "High",
+    CompromisedPackageCount > 0, "Medium",
+    TotalRiskScore >= 70, "Medium",
+    "Low"
+)
+| project-reorder
+    Severity,
+    TotalRiskScore,
+    DeviceName,
+    CorrelationBucket,
+    FirstSeen,
+    LastSeen,
+    Hits,
+    IdeEventCount,
+    KnownIoCCount,
+    CompromisedPackageCount,
+    Accounts,
+    EvidenceTypes,
+    EvidenceDetails,
+    FilePaths,
+    ProcessNames,
+    ParentProcesses,
+    CommandLines,
+    PackagePairs,
+    Sources,
+    Confidences,
+    Notes
+| order by TotalRiskScore desc, LastSeen desc
