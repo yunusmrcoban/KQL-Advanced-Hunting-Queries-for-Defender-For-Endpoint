@@ -1,0 +1,84 @@
+DeviceProcessEvents
+| where TimeGenerated > ago(3h)
+| extend CmdL = tolower(coalesce(ProcessCommandLine, ""))
+| where CmdL has_any (dynamic([
+    "npm ", "npm.cmd", "npx ", "pnpm ", "yarn ", "bun ",
+    "pip ", "pip3 ", "python -m pip", "poetry ", "pipenv ", "uv pip", "conda ",
+    "gem ", "bundle ", "cargo ", "go install ", "dotnet add package", "nuget ", "composer "
+]))
+| extend Ecosystem = case(
+    CmdL has "npm " or CmdL has "npx " or CmdL has "pnpm " or CmdL has "yarn " or CmdL has "bun ", "npm",
+    CmdL has "pip " or CmdL has "pip3 " or CmdL has "python -m pip" or CmdL has "poetry " or CmdL has "pipenv " or CmdL has "uv pip" or CmdL has "conda ", "pypi",
+    CmdL has "gem " or CmdL has "bundle ", "rubygems",
+    CmdL has "cargo ", "crates",
+    CmdL has "go install ", "go",
+    CmdL has "dotnet add package" or CmdL has "nuget ", "nuget",
+    CmdL has "composer ", "packagist",
+    "other"
+)
+| extend PackageName = tolower(coalesce(
+    extract(@'(?:npm\s+(?:i|install)|pnpm\s+(?:i|install|add)|yarn\s+add|bun\s+add)\s+((?:@[a-z0-9\._-]+/)?[a-z0-9\._-]+)(?:@[0-9a-z\._\-\+]+)?', 1, CmdL),
+    extract(@'pip3?\s+install\s+([a-z0-9\._-]+)(?:==[0-9a-z\._\-\+]+)?', 1, CmdL),
+    extract(@'python\s+-m\s+pip\s+install\s+([a-z0-9\._-]+)(?:==[0-9a-z\._\-\+]+)?', 1, CmdL),
+    extract(@'poetry\s+add\s+([a-z0-9\._-]+)(?:@[0-9a-z\._\-\+]+)?', 1, CmdL),
+    extract(@'pipenv\s+install\s+([a-z0-9\._-]+)(?:==[0-9a-z\._\-\+]+)?', 1, CmdL),
+    extract(@'uv\s+pip\s+install\s+([a-z0-9\._-]+)(?:==[0-9a-z\._\-\+]+)?', 1, CmdL),
+    ""
+))
+| extend PackageVersion = tolower(coalesce(
+    extract(@'(?:npm\s+(?:i|install)|pnpm\s+(?:i|install|add)|yarn\s+add|bun\s+add)\s+(?:@[a-z0-9\._-]+/)?[a-z0-9\._-]+@([0-9a-z\._\-\+]+)', 1, CmdL),
+    extract(@'pip3?\s+install\s+[a-z0-9\._-]+==([0-9a-z\._\-\+]+)', 1, CmdL),
+    extract(@'python\s+-m\s+pip\s+install\s+[a-z0-9\._-]+==([0-9a-z\._\-\+]+)', 1, CmdL),
+    extract(@'poetry\s+add\s+[a-z0-9\._-]+@([0-9a-z\._\-\+]+)', 1, CmdL),
+    extract(@'pipenv\s+install\s+[a-z0-9\._-]+==([0-9a-z\._\-\+]+)', 1, CmdL),
+    extract(@'uv\s+pip\s+install\s+[a-z0-9\._-]+==([0-9a-z\._\-\+]+)', 1, CmdL),
+    ""
+))
+| where isnotempty(Ecosystem) and isnotempty(PackageName)
+| lookup kind=inner (
+    externaldata(RawLine: string) [
+        @'https://raw.githubusercontent.com/Cobenian/shai-hulud-detect/refs/heads/main/compromised-packages.txt'
+    ] with (format='txt')
+    | where isnotempty(trim(@'\s', RawLine)) and RawLine !startswith "#"
+    | extend Parts = split(RawLine, ":")
+    | extend
+        Ecosystem = iff(array_length(Parts) >= 3, tolower(trim(@' ', tostring(Parts[0]))), "npm"),
+        PackageName = iff(array_length(Parts) >= 3, tolower(trim(@' ', tostring(Parts[1]))), tolower(trim(@' ', tostring(Parts[0])))),
+        WatchlistPackageVersion = iff(array_length(Parts) >= 3, tolower(trim(@' ', tostring(Parts[2]))), iff(array_length(Parts) >= 2, tolower(trim(@' ', tostring(Parts[1]))), ""))
+    | where isnotempty(Ecosystem) and isnotempty(PackageName)
+    | project Ecosystem, PackageName, WatchlistPackageVersion
+) on Ecosystem, PackageName
+| where isempty(WatchlistPackageVersion) or isempty(PackageVersion) or PackageVersion == WatchlistPackageVersion
+| summarize
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated),
+    EventCount = count(),
+    Accounts = make_set(tostring(AccountName), 10),
+    PackagePairs = make_set(strcat(
+        Ecosystem, ":", PackageName,
+        iff(isnotempty(PackageVersion), strcat("@", PackageVersion), ""),
+        iff(isnotempty(WatchlistPackageVersion) and isempty(PackageVersion), strcat(" [known-bad: @", WatchlistPackageVersion, "]"), "")
+    ), 20),
+    EvidenceDetails = make_set(strcat(
+        "Compromised package: ", Ecosystem, ":", PackageName,
+        iff(isnotempty(PackageVersion), strcat("@", PackageVersion), ""),
+        iff(isnotempty(WatchlistPackageVersion), strcat(" [feed: @", WatchlistPackageVersion, "]"), "")
+    ), 20),
+    ProcessNames = make_set(FileName, 10),
+    ParentProcesses = make_set(InitiatingProcessFileName, 10),
+    CommandLines = make_set(ProcessCommandLine, 10)
+    by DeviceName
+| extend Severity = "High"
+| project-reorder
+    Severity,
+    DeviceName,
+    FirstSeen,
+    LastSeen,
+    EventCount,
+    Accounts,
+    PackagePairs,
+    EvidenceDetails,
+    ProcessNames,
+    ParentProcesses,
+    CommandLines
+| order by LastSeen desc
